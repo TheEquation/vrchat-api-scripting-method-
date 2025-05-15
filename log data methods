@@ -1,0 +1,1094 @@
+// Decompiled with JetBrains decompiler
+// Type: VRCX.LogWatcher
+// Assembly: VRCX, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null
+// MVID: F498D5C0-EE85-48AF-85F9-CFE34D3CF65C
+// Assembly location: C:\Program Files\VRCX\VRCX.dll
+
+using CefSharp;
+using NLog;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+
+#nullable disable
+namespace VRCX;
+
+public class LogWatcher
+{
+  public static readonly LogWatcher Instance;
+  private static readonly Logger logger = LogManager.GetCurrentClassLogger();
+  private Dictionary<string, LogWatcher.LogContext> m_LogContextMap;
+  private DirectoryInfo m_LogDirectoryInfo;
+  private List<string[]> m_LogList;
+  private ReaderWriterLockSlim m_LogListLock;
+  private bool m_FirstRun = true;
+  private bool m_ResetLog;
+  private Thread m_Thread;
+  private DateTime tillDate = DateTime.UtcNow;
+  public bool VrcClosedGracefully;
+  private readonly ConcurrentQueue<string> m_LogQueue = new ConcurrentQueue<string>();
+
+  static LogWatcher() => LogWatcher.Instance = new LogWatcher();
+
+  public void Init()
+  {
+    this.m_LogDirectoryInfo = new DirectoryInfo(Program.AppApiInstance.GetVRChatAppDataLocation());
+    this.m_LogContextMap = new Dictionary<string, LogWatcher.LogContext>();
+    this.m_LogListLock = new ReaderWriterLockSlim();
+    this.m_LogList = new List<string[]>();
+    this.m_Thread = new Thread(new ThreadStart(this.ThreadLoop))
+    {
+      IsBackground = true
+    };
+    this.m_Thread.Start();
+  }
+
+  public void Exit()
+  {
+    Thread thread = this.m_Thread;
+    this.m_Thread = (Thread) null;
+    thread.Interrupt();
+    thread.Join();
+  }
+
+  public void Reset()
+  {
+    this.m_ResetLog = true;
+    this.m_Thread?.Interrupt();
+  }
+
+  public void SetDateTill(string date)
+  {
+    this.tillDate = DateTime.Parse(date, (IFormatProvider) CultureInfo.InvariantCulture, DateTimeStyles.None).ToUniversalTime();
+    LogWatcher.logger.Info<DateTime>("SetDateTill: {0}", this.tillDate.ToLocalTime());
+  }
+
+  private void ThreadLoop()
+  {
+    while (this.m_Thread != null)
+    {
+      this.Update();
+      try
+      {
+        Thread.Sleep(1000);
+      }
+      catch (ThreadInterruptedException ex)
+      {
+      }
+    }
+  }
+
+  private void Update()
+  {
+    if (this.m_ResetLog)
+    {
+      this.m_FirstRun = true;
+      this.m_ResetLog = false;
+      this.m_LogContextMap.Clear();
+      this.m_LogListLock.EnterWriteLock();
+      try
+      {
+        this.m_LogList.Clear();
+      }
+      finally
+      {
+        this.m_LogListLock.ExitWriteLock();
+      }
+    }
+    HashSet<string> stringSet = new HashSet<string>((IEnumerable<string>) this.m_LogContextMap.Keys);
+    this.m_LogDirectoryInfo.Refresh();
+    if (this.m_LogDirectoryInfo.LinkTarget == null && this.m_LogDirectoryInfo.Exists || Directory.Exists(this.m_LogDirectoryInfo.LinkTarget))
+    {
+      FileInfo[] files = this.m_LogDirectoryInfo.GetFiles("output_log_*.txt", SearchOption.TopDirectoryOnly);
+      Array.Sort<FileInfo>(files, (Comparison<FileInfo>) ((a, b) => a.CreationTimeUtc.CompareTo(b.CreationTimeUtc)));
+      foreach (FileInfo fileInfo in files)
+      {
+        fileInfo.Refresh();
+        if (fileInfo.Exists && DateTime.Compare(fileInfo.LastWriteTimeUtc, this.tillDate) >= 0)
+        {
+          LogWatcher.LogContext logContext;
+          if (this.m_LogContextMap.TryGetValue(fileInfo.Name, out logContext))
+          {
+            stringSet.Remove(fileInfo.Name);
+          }
+          else
+          {
+            logContext = new LogWatcher.LogContext();
+            this.m_LogContextMap.Add(fileInfo.Name, logContext);
+          }
+          if (logContext.Length != fileInfo.Length)
+          {
+            logContext.Length = fileInfo.Length;
+            this.ParseLog(fileInfo, logContext);
+          }
+        }
+      }
+    }
+    foreach (string key in stringSet)
+      this.m_LogContextMap.Remove(key);
+    this.m_FirstRun = false;
+  }
+
+  private void ParseLog(FileInfo fileInfo, LogWatcher.LogContext logContext)
+  {
+    string line = string.Empty;
+    try
+    {
+      using (FileStream fileStream = new FileStream(fileInfo.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536 /*0x010000*/, FileOptions.SequentialScan))
+      {
+        fileStream.Position = logContext.Position;
+        StreamReader streamReader = new StreamReader((Stream) fileStream, Encoding.UTF8);
+label_3:
+        try
+        {
+          int num;
+          do
+          {
+            DateTime result;
+            do
+            {
+              do
+              {
+                line = streamReader.ReadLine();
+                if (line == null)
+                {
+                  logContext.Position = fileStream.Position;
+                  return;
+                }
+              }
+              while (line.Length == 0 || this.ParseLogUdonException(fileInfo, line) || line.Length <= 36 || line[31 /*0x1F*/] != '-');
+              if (DateTime.TryParseExact(line.Substring(0, 19), "yyyy.MM.dd HH:mm:ss", (IFormatProvider) CultureInfo.InvariantCulture, DateTimeStyles.None, out result))
+                result = result.ToUniversalTime();
+              else
+                goto label_10;
+            }
+            while (DateTime.Compare(result, this.tillDate) <= 0);
+            if (DateTime.UtcNow.AddMinutes(61.0) < result)
+            {
+              LogWatcher.logger.Warn("Invalid log time, too new: {0}", line);
+              continue;
+            }
+            num = 34;
+            if (line[num] == '[')
+            {
+              if (this.ParseLogOnPlayerJoinedOrLeft(fileInfo, logContext, line, num) || this.ParseLogLocation(fileInfo, logContext, line, num) || this.ParseLogLocationDestination(fileInfo, logContext, line, num) || this.ParseLogPortalSpawn(fileInfo, logContext, line, num) || this.ParseLogNotification(fileInfo, logContext, line, num) || this.ParseLogAPIRequest(fileInfo, logContext, line, num) || this.ParseLogAvatarChange(fileInfo, logContext, line, num) || this.ParseLogJoinBlocked(fileInfo, logContext, line, num) || this.ParseLogAvatarPedestalChange(fileInfo, logContext, line, num) || this.ParseLogVideoError(fileInfo, logContext, line, num) || this.ParseLogVideoChange(fileInfo, logContext, line, num) || this.ParseLogAVProVideoChange(fileInfo, logContext, line, num) || this.ParseLogUsharpVideoPlay(fileInfo, logContext, line, num) || this.ParseLogUsharpVideoSync(fileInfo, logContext, line, num) || this.ParseLogWorldVRCX(fileInfo, logContext, line, num) || this.ParseLogWorldDataVRCX(fileInfo, logContext, line, num) || this.ParseLogOnAudioConfigurationChanged(fileInfo, logContext, line, num) || this.ParseLogScreenshot(fileInfo, logContext, line, num) || this.ParseLogStringDownload(fileInfo, logContext, line, num) || this.ParseLogImageDownload(fileInfo, logContext, line, num) || this.ParseVoteKick(fileInfo, logContext, line, num) || this.ParseFailedToJoin(fileInfo, logContext, line, num) || this.ParseInstanceResetWarning(fileInfo, logContext, line, num) || this.ParseVoteKickInitiation(fileInfo, logContext, line, num) || this.ParseVoteKickSuccess(fileInfo, logContext, line, num) || !this.ParseStickerSpawn(fileInfo, logContext, line, num))
+                continue;
+              continue;
+            }
+            continue;
+label_10:
+            LogWatcher.logger.Warn("Failed to parse log date: {0}", line);
+          }
+          while (this.ParseLogShaderKeywordsLimit(fileInfo, logContext, line, num) || this.ParseLogSDK2VideoPlay(fileInfo, logContext, line, num) || this.ParseApplicationQuit(fileInfo, logContext, line, num) || this.ParseOpenVRInit(fileInfo, logContext, line, num) || this.ParseDesktopMode(fileInfo, logContext, line, num) || !this.ParseOscFailedToStart(fileInfo, logContext, line, num));
+          goto label_3;
+        }
+        finally
+        {
+          streamReader?.Dispose();
+        }
+      }
+    }
+    catch (Exception ex)
+    {
+      LogWatcher.logger.Warn(ex, "Failed to parse log file: {0} {1} {2}", new object[3]
+      {
+        (object) fileInfo.FullName,
+        (object) line,
+        (object) ex.Message
+      });
+    }
+  }
+
+  private void AppendLog(string[] item)
+  {
+    this.m_LogListLock.EnterWriteLock();
+    try
+    {
+      if (!this.m_FirstRun)
+      {
+        string str = JsonSerializer.Serialize<string[]>(item);
+        if (MainForm.Instance != null && MainForm.Instance.Browser != null)
+          MainForm.Instance.Browser.ExecuteScriptAsync("$app.addGameLogEvent", (object) str);
+      }
+      this.m_LogList.Add(item);
+    }
+    finally
+    {
+      this.m_LogListLock.ExitWriteLock();
+    }
+  }
+
+  public List<string> GetLogLines()
+  {
+    List<string> logLines = new List<string>();
+    string result;
+    while (this.m_LogQueue.TryDequeue(out result))
+      logLines.Add(result);
+    return logLines;
+  }
+
+  private string ConvertLogTimeToISO8601(string line)
+  {
+    DateTime result = !DateTime.TryParseExact(line.Substring(0, 19), "yyyy.MM.dd HH:mm:ss", (IFormatProvider) CultureInfo.InvariantCulture, DateTimeStyles.None, out result) ? DateTime.UtcNow : result.ToUniversalTime();
+    return result.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'", (IFormatProvider) CultureInfo.InvariantCulture);
+  }
+
+  private bool ParseLogLocation(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (line.Contains("[Behaviour] Entering Room: "))
+    {
+      int num = line.LastIndexOf("] Entering Room: ", StringComparison.Ordinal);
+      if (num < 0)
+        return true;
+      int startIndex = num + 17;
+      if (startIndex >= line.Length)
+        return true;
+      string str = line.Substring(startIndex);
+      logContext.RecentWorldName = str;
+      return true;
+    }
+    if (!line.Contains("[Behaviour] Joining ") || line.Contains("] Joining or Creating Room: ") || line.Contains("] Joining friend: "))
+      return false;
+    int num1 = line.LastIndexOf("] Joining ", StringComparison.Ordinal);
+    if (num1 < 0)
+      return true;
+    int startIndex1 = num1 + 10;
+    if (startIndex1 >= line.Length)
+      return true;
+    string str1 = line.Substring(startIndex1);
+    this.AppendLog(new string[5]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "location",
+      str1,
+      logContext.RecentWorldName
+    });
+    logContext.LastAudioDevice = string.Empty;
+    logContext.LastVideoError = string.Empty;
+    logContext.locationDestination = string.Empty;
+    this.VrcClosedGracefully = false;
+    return true;
+  }
+
+  private bool ParseLogScreenshot(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("[VRC Camera] Took screenshot to: "))
+      return false;
+    int num = line.LastIndexOf("] Took screenshot to: ", StringComparison.Ordinal);
+    if (num < 0)
+      return true;
+    string str = line.Substring(num + 22);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "screenshot",
+      str
+    });
+    return true;
+  }
+
+  private bool ParseLogLocationDestination(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (line.Contains("[Behaviour] Successfully left room"))
+    {
+      this.AppendLog(new string[4]
+      {
+        fileInfo.Name,
+        this.ConvertLogTimeToISO8601(line),
+        "location-destination",
+        logContext.locationDestination
+      });
+      logContext.locationDestination = string.Empty;
+      return true;
+    }
+    if (!line.Contains("[Behaviour] Destination fetching: "))
+      return false;
+    int num = line.LastIndexOf("] Destination fetching: ", StringComparison.Ordinal);
+    if (num < 0)
+      return true;
+    int startIndex = num + 24;
+    if (startIndex >= line.Length)
+      return true;
+    logContext.locationDestination = line.Substring(startIndex);
+    return true;
+  }
+
+  private bool ParseLogOnPlayerJoinedOrLeft(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (line.Contains("[Behaviour] OnPlayerJoined") && !line.Contains("] OnPlayerJoined:"))
+    {
+      int num = line.LastIndexOf("] OnPlayerJoined", StringComparison.Ordinal);
+      if (num < 0)
+        return true;
+      int startIndex = num + 17;
+      if (startIndex > line.Length)
+        return true;
+      (string DisplayName, string UserId) userInfo = LogWatcher.ParseUserInfo(line.Substring(startIndex));
+      this.AppendLog(new string[5]
+      {
+        fileInfo.Name,
+        this.ConvertLogTimeToISO8601(line),
+        "player-joined",
+        userInfo.DisplayName,
+        userInfo.UserId
+      });
+      return true;
+    }
+    if (!line.Contains("[Behaviour] OnPlayerLeft") || line.Contains("] OnPlayerLeftRoom") || line.Contains("] OnPlayerLeft:"))
+      return false;
+    int num1 = line.LastIndexOf("] OnPlayerLeft", StringComparison.Ordinal);
+    if (num1 < 0)
+      return true;
+    int startIndex1 = num1 + 15;
+    if (startIndex1 > line.Length)
+      return true;
+    (string DisplayName, string UserId) userInfo1 = LogWatcher.ParseUserInfo(line.Substring(startIndex1));
+    this.AppendLog(new string[5]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "player-left",
+      userInfo1.DisplayName,
+      userInfo1.UserId
+    });
+    return true;
+  }
+
+  private bool ParseLogPortalSpawn(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("[Behaviour] Instantiated a (Clone [") || !line.Contains("] Portals/PortalInternalDynamic)"))
+      return false;
+    this.AppendLog(new string[3]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "portal-spawn"
+    });
+    return true;
+  }
+
+  private bool ParseLogShaderKeywordsLimit(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("Maximum number (384) of shader global keywords exceeded"))
+      return false;
+    if (logContext.ShaderKeywordsLimitReached)
+      return true;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      "Shader Keyword Limit has been reached"
+    });
+    logContext.ShaderKeywordsLimitReached = true;
+    return true;
+  }
+
+  private bool ParseLogJoinBlocked(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("] Master is not sending any events! Moving to a new instance."))
+      return false;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      "Joining instance blocked by master"
+    });
+    return true;
+  }
+
+  private bool ParseLogAvatarPedestalChange(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[Network Processing] RPC invoked SwitchAvatar on AvatarPedestal for ", 0, 68, StringComparison.Ordinal) != 0)
+      return false;
+    string str = line.Substring(offset + 68);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      str + " changed avatar pedestal"
+    });
+    return true;
+  }
+
+  private bool ParseLogVideoError(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (line.Contains("[Video Playback] ERROR: "))
+    {
+      string str = line.Substring(offset + 24);
+      if (str == logContext.LastVideoError)
+        return true;
+      logContext.LastVideoError = str;
+      if (str.Contains("Sign in to confirm you’re not a bot"))
+        str += "\n[VRCX]: We've made a program to help with this error, you can try it out here: https://github.com/EllyVR/VRCVideoCacher";
+      this.AppendLog(new string[4]
+      {
+        fileInfo.Name,
+        this.ConvertLogTimeToISO8601(line),
+        "event",
+        "VideoError: " + str
+      });
+      return true;
+    }
+    if (line.Contains("[AVProVideo] Error: "))
+    {
+      string str = line.Substring(offset + 20);
+      if (str == logContext.LastVideoError)
+        return true;
+      logContext.LastVideoError = str;
+      if (str.Contains("Sign in to confirm you’re not a bot"))
+        str += "\n[VRCX]: We've made a program to help with this error, you can try it out here: https://github.com/EllyVR/VRCVideoCacher";
+      this.AppendLog(new string[4]
+      {
+        fileInfo.Name,
+        this.ConvertLogTimeToISO8601(line),
+        "event",
+        "VideoError: " + str
+      });
+      return true;
+    }
+    if (!line.Contains("Attempted to play an untrusted URL"))
+      return false;
+    string str1 = line.Substring(offset);
+    if (str1 == logContext.LastVideoError)
+      return true;
+    logContext.LastVideoError = str1;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      "VideoError: " + str1
+    });
+    return true;
+  }
+
+  private bool ParseLogWorldVRCX(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[VRCX] ", 0, 7, StringComparison.Ordinal) != 0)
+      return false;
+    string str = line.Substring(offset + 7);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "vrcx",
+      str
+    });
+    return true;
+  }
+
+  private bool ParseLogWorldDataVRCX(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[VRCX-World] ", 0, 13, StringComparison.Ordinal) != 0)
+      return false;
+    string json = line.Substring(offset + 13);
+    WorldDBManager.Instance.ProcessLogWorldDataRequest(json);
+    return true;
+  }
+
+  private bool ParseLogVideoChange(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[Video Playback] Attempting to resolve URL '", 0, 44, StringComparison.Ordinal) != 0 || line.LastIndexOf('\'') < 0)
+      return false;
+    string str1 = line.Substring(offset + 44);
+    string str2 = str1.Remove(str1.Length - 1);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "video-play",
+      str2
+    });
+    return true;
+  }
+
+  private bool ParseLogAVProVideoChange(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[Video Playback] Resolving URL '", 0, 32 /*0x20*/, StringComparison.Ordinal) != 0 || line.LastIndexOf('\'') < 0)
+      return false;
+    string str1 = line.Substring(offset + 32 /*0x20*/);
+    string str2 = str1.Remove(str1.Length - 1);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "video-play",
+      str2
+    });
+    return true;
+  }
+
+  private bool ParseLogSDK2VideoPlay(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "User ", 0, 5, StringComparison.Ordinal) != 0)
+      return false;
+    int num = line.LastIndexOf(" added URL ", StringComparison.Ordinal);
+    if (num < 0)
+      return false;
+    string str1 = line.Substring(offset + 5, num - (offset + 5));
+    string str2 = line.Substring(num + 11);
+    this.AppendLog(new string[5]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "video-play",
+      str2,
+      str1
+    });
+    return true;
+  }
+
+  private bool ParseLogUsharpVideoPlay(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[USharpVideo] Started video load for URL: ", 0, 42, StringComparison.Ordinal) != 0)
+      return false;
+    int num = line.LastIndexOf(", requested by ", StringComparison.Ordinal);
+    if (num < 0)
+      return false;
+    string str1 = line.Substring(offset + 42, num - (offset + 42));
+    string str2 = line.Substring(num + 15);
+    this.AppendLog(new string[5]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "video-play",
+      str1,
+      str2
+    });
+    return true;
+  }
+
+  private bool ParseLogUsharpVideoSync(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[USharpVideo] Syncing video to ", 0, 31 /*0x1F*/, StringComparison.Ordinal) != 0)
+      return false;
+    string str = line.Substring(offset + 31 /*0x1F*/);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "video-sync",
+      str
+    });
+    return true;
+  }
+
+  private bool ParseLogNotification(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[API] Received Notification: <", 0, 30, StringComparison.Ordinal) != 0)
+      return false;
+    int num = line.LastIndexOf("> received at ", StringComparison.Ordinal);
+    if (num < 0)
+      return false;
+    string str = line.Substring(offset + 30, num - (offset + 30));
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "notification",
+      str
+    });
+    return true;
+  }
+
+  private bool ParseLogAPIRequest(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[API] [", 0, 7, StringComparison.Ordinal) != 0)
+      return false;
+    int num = line.LastIndexOf("] Sending Get request to ", StringComparison.Ordinal);
+    if (num < 0)
+      return false;
+    string str = line.Substring(num + 25);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "api-request",
+      str
+    });
+    return true;
+  }
+
+  private bool ParseLogAvatarChange(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[Behaviour] Switching ", 0, 22, StringComparison.Ordinal) != 0)
+      return false;
+    int num = line.LastIndexOf(" to avatar ", StringComparison.Ordinal);
+    if (num < 0)
+      return false;
+    string str1 = line.Substring(offset + 22, num - (offset + 22));
+    string str2 = line.Substring(num + 11);
+    this.AppendLog(new string[5]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "avatar-change",
+      str1,
+      str2
+    });
+    return true;
+  }
+
+  private bool ParseLogOnAudioConfigurationChanged(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (line.Contains("[Always] uSpeak: OnAudioConfigurationChanged"))
+    {
+      logContext.AudioDeviceChanged = true;
+      return true;
+    }
+    if (!line.Contains("[Always] uSpeak: SetInputDevice 0"))
+      return false;
+    int num = line.LastIndexOf(") '", StringComparison.Ordinal);
+    if (num < 0)
+      return true;
+    int startIndex = num + 3;
+    int length = Math.Min(line.Length - 1 - startIndex + 1, line.Length - startIndex);
+    if (length <= 0)
+      return true;
+    string str = line.Substring(startIndex, length);
+    if (string.IsNullOrEmpty(logContext.LastAudioDevice))
+    {
+      logContext.AudioDeviceChanged = false;
+      logContext.LastAudioDevice = str;
+      return true;
+    }
+    if (!logContext.AudioDeviceChanged || logContext.LastAudioDevice == str)
+      return true;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      $"Audio device changed, mic set to '{str}'"
+    });
+    logContext.LastAudioDevice = str;
+    logContext.AudioDeviceChanged = false;
+    return true;
+  }
+
+  private bool ParseLogUdonException(FileInfo fileInfo, string line)
+  {
+    if (line.Contains("[PyPyDance]"))
+    {
+      this.AppendLog(new string[4]
+      {
+        fileInfo.Name,
+        this.ConvertLogTimeToISO8601(line),
+        "udon-exception",
+        line
+      });
+      return true;
+    }
+    int startIndex = line.IndexOf(" ---> VRC.Udon.VM.UdonVMException: ", StringComparison.Ordinal);
+    if (startIndex < 0)
+      return false;
+    string str = line.Substring(startIndex);
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "udon-exception",
+      str
+    });
+    return true;
+  }
+
+  private bool ParseApplicationQuit(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "VRCApplication: OnApplicationQuit at ", 0, 37, StringComparison.Ordinal) != 0 && string.Compare(line, offset, "VRCApplication: HandleApplicationQuit at ", 0, 41, StringComparison.Ordinal) != 0)
+      return false;
+    this.AppendLog(new string[3]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "vrc-quit"
+    });
+    this.VrcClosedGracefully = true;
+    return true;
+  }
+
+  private bool ParseOpenVRInit(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "Initializing VRSDK.", 0, 19, StringComparison.Ordinal) != 0 && string.Compare(line, offset, "STEAMVR HMD Model: ", 0, 20, StringComparison.Ordinal) != 0)
+      return false;
+    this.AppendLog(new string[3]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "openvr-init"
+    });
+    return true;
+  }
+
+  private bool ParseDesktopMode(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "VR Disabled", 0, 11, StringComparison.Ordinal) != 0)
+      return false;
+    this.AppendLog(new string[3]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "desktop-mode"
+    });
+    return true;
+  }
+
+  private bool ParseLogStringDownload(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    string str1 = "] Attempting to load String from URL '";
+    if (!line.Contains(str1))
+      return false;
+    int num = line.LastIndexOf(str1, StringComparison.Ordinal);
+    if (num < 0)
+      return true;
+    string str2 = line.Substring(num + str1.Length);
+    string str3 = str2.Remove(str2.Length - 1);
+    if (str3.StartsWith("http://127.0.0.1:22500") || str3.StartsWith("http://localhost:22500"))
+      return true;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "resource-load-string",
+      str3
+    });
+    return true;
+  }
+
+  private bool ParseLogImageDownload(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    string str1 = "] Attempting to load image from URL '";
+    if (!line.Contains(str1))
+      return false;
+    int num = line.LastIndexOf(str1, StringComparison.Ordinal);
+    if (num < 0)
+      return true;
+    string str2 = line.Substring(num + str1.Length);
+    string str3 = str2.Remove(str2.Length - 1);
+    if (str3.StartsWith("http://127.0.0.1:22500") || str3.StartsWith("http://localhost:22500"))
+      return true;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "resource-load-image",
+      str3
+    });
+    return true;
+  }
+
+  private bool ParseVoteKick(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[Behaviour] Received executive message: ", 0, 40, StringComparison.Ordinal) != 0)
+      return false;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      line.Substring(offset + 40)
+    });
+    return true;
+  }
+
+  private bool ParseFailedToJoin(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "[Behaviour] Failed to join instance ", 0, 36, StringComparison.Ordinal) != 0)
+      return false;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      line.Substring(offset + 12)
+    });
+    return true;
+  }
+
+  private bool ParseOscFailedToStart(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (string.Compare(line, offset, "Could not Start OSC: ", 0, 21, StringComparison.Ordinal) != 0)
+      return false;
+    this.AppendLog(new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      $"VRChat couldn't start OSC server, \"{line.Substring(offset)}\""
+    });
+    return true;
+  }
+
+  private bool ParseInstanceResetWarning(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("[ModerationManager] This instance will be reset in "))
+      return false;
+    int num = line.IndexOf("[ModerationManager] This instance will be reset in ", StringComparison.Ordinal) + 20;
+    string[] strArray = new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      null
+    };
+    string str = line;
+    int startIndex = num;
+    strArray[3] = str.Substring(startIndex, str.Length - startIndex);
+    this.AppendLog(strArray);
+    return true;
+  }
+
+  private bool ParseVoteKickInitiation(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("[ModerationManager] A vote kick has been initiated against ", StringComparison.Ordinal))
+      return false;
+    int num = line.IndexOf("[ModerationManager] A vote kick has been initiated against ", StringComparison.Ordinal) + 20;
+    string[] strArray = new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      null
+    };
+    string str = line;
+    int startIndex = num;
+    strArray[3] = str.Substring(startIndex, str.Length - startIndex);
+    this.AppendLog(strArray);
+    return true;
+  }
+
+  private bool ParseVoteKickSuccess(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    if (!line.Contains("[ModerationManager] Vote to kick ", StringComparison.Ordinal))
+      return false;
+    int num = line.IndexOf("[ModerationManager] Vote to kick ", StringComparison.Ordinal) + 20;
+    string[] strArray = new string[4]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "event",
+      null
+    };
+    string str = line;
+    int startIndex = num;
+    strArray[3] = str.Substring(startIndex, str.Length - startIndex);
+    this.AppendLog(strArray);
+    return true;
+  }
+
+  private bool ParseStickerSpawn(
+    FileInfo fileInfo,
+    LogWatcher.LogContext logContext,
+    string line,
+    int offset)
+  {
+    int num = line.IndexOf("[StickersManager] User ", StringComparison.Ordinal);
+    if (num == -1 || !line.Contains("file_") || !line.Contains("spawned sticker"))
+      return false;
+    string userInfo = line.Substring(num + 23);
+    (string DisplayName, string UserId) = LogWatcher.ParseUserInfo(userInfo);
+    string str = userInfo.Substring(userInfo.IndexOf("file_", StringComparison.Ordinal));
+    this.AppendLog(new string[6]
+    {
+      fileInfo.Name,
+      this.ConvertLogTimeToISO8601(line),
+      "sticker-spawn",
+      DisplayName,
+      UserId,
+      str
+    });
+    return true;
+  }
+
+  public string[][] Get()
+  {
+    this.Update();
+    if (this.m_ResetLog || this.m_LogList.Count <= 0)
+      return new string[0][];
+    this.m_LogListLock.EnterWriteLock();
+    try
+    {
+      string[][] array;
+      if (this.m_LogList.Count > 1000)
+      {
+        array = new string[1000][];
+        this.m_LogList.CopyTo(0, array, 0, 1000);
+        this.m_LogList.RemoveRange(0, 1000);
+      }
+      else
+      {
+        array = this.m_LogList.ToArray();
+        this.m_LogList.Clear();
+      }
+      return array;
+    }
+    finally
+    {
+      this.m_LogListLock.ExitWriteLock();
+    }
+  }
+
+  private static (string DisplayName, string UserId) ParseUserInfo(string userInfo)
+  {
+    int length = userInfo.LastIndexOf(" (", StringComparison.Ordinal);
+    string str1;
+    string str2;
+    if (length >= 0)
+    {
+      str1 = userInfo.Substring(0, length);
+      str2 = userInfo.Substring(length + 2, userInfo.LastIndexOf(')') - (length + 2));
+    }
+    else
+    {
+      str1 = userInfo;
+      str2 = (string) null;
+    }
+    return (str1, str2);
+  }
+
+  private class LogContext
+  {
+    public bool AudioDeviceChanged;
+    public string LastAudioDevice;
+    public string LastVideoError;
+    public long Length;
+    public string locationDestination;
+    public long Position;
+    public string RecentWorldName;
+    public bool ShaderKeywordsLimitReached;
+  }
+}
