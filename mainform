@@ -1,0 +1,254 @@
+
+using CefSharp;
+using CefSharp.WinForms;
+using NLog;
+using System;
+using System.ComponentModel;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+
+#nullable enable
+namespace VRCX;
+
+public class MainForm : WinformBase
+{
+  public static 
+  #nullable disable
+  MainForm Instance;
+  public static NativeWindow nativeWindow;
+  private static readonly Logger logger = LogManager.GetCurrentClassLogger();
+  public ChromiumWebBrowser Browser;
+  private readonly Timer _saveTimer;
+  private int LastLocationX;
+  private int LastLocationY;
+  private int LastSizeWidth;
+  private int LastSizeHeight;
+  private FormWindowState LastWindowStateToRestore;
+  private IContainer components;
+  private ContextMenuStrip TrayMenu;
+  private ToolStripMenuItem TrayMenu_Open;
+  private ToolStripMenuItem TrayMenu_DevTools;
+  private ToolStripSeparator TrayMenu_Separator;
+  private ToolStripMenuItem TrayMenu_Quit;
+  private NotifyIcon TrayIcon;
+
+  public MainForm()
+  {
+    MainForm.Instance = this;
+    this.InitializeComponent();
+    MainForm.nativeWindow = NativeWindow.FromHandle(this.Handle);
+    this._saveTimer = new Timer();
+    this._saveTimer.Interval = 5000;
+    this._saveTimer.Tick += new EventHandler(this.SaveTimer_Tick);
+    try
+    {
+      Icon associatedIcon = Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location);
+      this.Icon = associatedIcon;
+      this.TrayIcon.Icon = associatedIcon;
+    }
+    catch (Exception ex)
+    {
+      MainForm.logger.Error<Exception>(ex);
+    }
+    ChromiumWebBrowser chromiumWebBrowser = new ChromiumWebBrowser("file://vrcx/index.html");
+    chromiumWebBrowser.DragHandler = (IDragHandler) new CustomDragHandler();
+    chromiumWebBrowser.MenuHandler = (IContextMenuHandler) new CustomMenuHandler();
+    chromiumWebBrowser.DownloadHandler = (IDownloadHandler) new CustomDownloadHandler();
+    chromiumWebBrowser.BrowserSettings.DefaultEncoding = "UTF-8";
+    ((Control) chromiumWebBrowser).Dock = DockStyle.Fill;
+    this.Browser = chromiumWebBrowser;
+    this.Browser.IsBrowserInitializedChanged += (EventHandler) ((A, B) =>
+    {
+      if (!Program.LaunchDebug)
+        return;
+      this.Browser.ShowDevTools();
+    });
+    JavascriptBindings.ApplyAppJavascriptBindings(this.Browser.JavascriptObjectRepository);
+    this.Browser.ConsoleMessage += (EventHandler<ConsoleMessageEventArgs>) ((_, args) => MainForm.logger.Debug($"{args.Message} ({args.Source}:{args.Line.ToString()})"));
+    this.Controls.Add((Control) this.Browser);
+  }
+
+  private void MainForm_Load(object sender, EventArgs e)
+  {
+    try
+    {
+      int.TryParse(VRCXStorage.Instance.Get("VRCX_LocationX"), out this.LastLocationX);
+      int.TryParse(VRCXStorage.Instance.Get("VRCX_LocationY"), out this.LastLocationY);
+      int.TryParse(VRCXStorage.Instance.Get("VRCX_SizeWidth"), out this.LastSizeWidth);
+      int.TryParse(VRCXStorage.Instance.Get("VRCX_SizeHeight"), out this.LastSizeHeight);
+      Point point = new Point(this.LastLocationX, this.LastLocationY);
+      Size size = new Size(this.LastSizeWidth, this.LastSizeHeight);
+      if (Screen.FromPoint(point).Bounds.Contains(point.X, point.Y))
+        this.Location = point;
+      this.Size = new Size(1920, 1080);
+      if (size.Width > 0)
+      {
+        if (size.Height > 0)
+          this.Size = size;
+      }
+    }
+    catch (Exception ex)
+    {
+      MainForm.logger.Error<Exception>(ex);
+    }
+    try
+    {
+      FormWindowState formWindowState = this.WindowState;
+      bool flag1 = VRCXStorage.Instance.Get("VRCX_StartAsMinimizedState") == "true";
+      bool flag2 = VRCXStorage.Instance.Get("VRCX_CloseToTray") == "true";
+      int result;
+      if (int.TryParse(VRCXStorage.Instance.Get("VRCX_WindowState"), out result))
+        formWindowState = (FormWindowState) result;
+      if (formWindowState == FormWindowState.Minimized)
+        formWindowState = FormWindowState.Normal;
+      this.WindowState = formWindowState;
+      this.LastWindowStateToRestore = formWindowState;
+      if (StartupArgs.LaunchArguments.IsStartup & flag1)
+      {
+        if (flag2)
+        {
+          this.BeginInvoke(new Action(((Control) this).Hide));
+          return;
+        }
+        this.WindowState = FormWindowState.Minimized;
+      }
+    }
+    catch (Exception ex)
+    {
+      MainForm.logger.Error<Exception>(ex);
+    }
+    ((Control) this.Browser).Invalidate();
+  }
+
+  private void MainForm_Resize(object sender, EventArgs e)
+  {
+    if (this.WindowState != FormWindowState.Minimized)
+      this.LastWindowStateToRestore = this.WindowState;
+    if (this.WindowState != FormWindowState.Normal)
+      return;
+    this.LastSizeWidth = this.Size.Width;
+    this.LastSizeHeight = this.Size.Height;
+    this._saveTimer?.Start();
+  }
+
+  private void SaveTimer_Tick(object sender, EventArgs e)
+  {
+    this.SaveWindowState();
+    this._saveTimer?.Stop();
+  }
+
+  private void MainForm_Move(object sender, EventArgs e)
+  {
+    if (this.WindowState != FormWindowState.Normal)
+      return;
+    Point location = this.Location;
+    this.LastLocationX = location.X;
+    location = this.Location;
+    this.LastLocationY = location.Y;
+    this._saveTimer?.Start();
+  }
+
+  private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+  {
+    if (e.CloseReason != CloseReason.UserClosing || !"true".Equals(VRCXStorage.Instance.Get("VRCX_CloseToTray")))
+      return;
+    e.Cancel = true;
+    this.Hide();
+  }
+
+  private void SaveWindowState()
+  {
+    VRCXStorage.Instance.Set("VRCX_LocationX", this.LastLocationX.ToString());
+    VRCXStorage.Instance.Set("VRCX_LocationY", this.LastLocationY.ToString());
+    VRCXStorage.Instance.Set("VRCX_SizeWidth", this.LastSizeWidth.ToString());
+    VRCXStorage.Instance.Set("VRCX_SizeHeight", this.LastSizeHeight.ToString());
+    VRCXStorage.Instance.Set("VRCX_WindowState", ((int) this.LastWindowStateToRestore).ToString());
+    VRCXStorage.Instance.Flush();
+  }
+
+  private void MainForm_FormClosed(object sender, FormClosedEventArgs e) => this.SaveWindowState();
+
+  private void TrayIcon_MouseClick(object sender, MouseEventArgs e)
+  {
+    if (e.Button != MouseButtons.Left)
+      return;
+    this.Focus_Window();
+  }
+
+  private void TrayMenu_Open_Click(object sender, EventArgs e) => this.Focus_Window();
+
+  public void Focus_Window()
+  {
+    this.Show();
+    if (this.WindowState == FormWindowState.Minimized)
+      this.WindowState = this.LastWindowStateToRestore;
+    this.Activate();
+  }
+
+  private void TrayMenu_DevTools_Click(object sender, EventArgs e)
+  {
+    MainForm.Instance.Browser.ShowDevTools();
+  }
+
+  private void TrayMenu_Quit_Click(object sender, EventArgs e)
+  {
+    this.SaveWindowState();
+    Application.Exit();
+  }
+
+  protected override void Dispose(bool disposing)
+  {
+    if (disposing && this.components != null)
+      this.components.Dispose();
+    base.Dispose(disposing);
+  }
+
+  private void InitializeComponent()
+  {
+    this.components = (IContainer) new System.ComponentModel.Container();
+    this.TrayMenu = new ContextMenuStrip(this.components);
+    this.TrayMenu_Open = new ToolStripMenuItem();
+    this.TrayMenu_DevTools = new ToolStripMenuItem();
+    this.TrayMenu_Separator = new ToolStripSeparator();
+    this.TrayMenu_Quit = new ToolStripMenuItem();
+    this.TrayIcon = new NotifyIcon(this.components);
+    this.TrayMenu.SuspendLayout();
+    this.SuspendLayout();
+    this.TrayMenu.Items.AddRange((ToolStripItem) this.TrayMenu_Open, (ToolStripItem) this.TrayMenu_DevTools, (ToolStripItem) this.TrayMenu_Separator, (ToolStripItem) this.TrayMenu_Quit);
+    this.TrayMenu.Name = "TrayMenu";
+    this.TrayMenu.Size = new Size(132, 54);
+    this.TrayMenu_Open.Name = "TrayMenu_Open";
+    this.TrayMenu_Open.Size = new Size(131, 22);
+    this.TrayMenu_Open.Text = "Open";
+    this.TrayMenu_Open.Click += new EventHandler(this.TrayMenu_Open_Click);
+    this.TrayMenu_DevTools.Name = "TrayMenu_DevTools";
+    this.TrayMenu_DevTools.Size = new Size(131, 22);
+    this.TrayMenu_DevTools.Text = "DevTools";
+    this.TrayMenu_DevTools.Click += new EventHandler(this.TrayMenu_DevTools_Click);
+    this.TrayMenu_Separator.Name = "TrayMenu_Separator";
+    this.TrayMenu_Separator.Size = new Size(128 /*0x80*/, 6);
+    this.TrayMenu_Quit.Name = "TrayMenu_Quit";
+    this.TrayMenu_Quit.Size = new Size(131, 22);
+    this.TrayMenu_Quit.Text = "Quit VRCX";
+    this.TrayMenu_Quit.Click += new EventHandler(this.TrayMenu_Quit_Click);
+    this.TrayIcon.ContextMenuStrip = this.TrayMenu;
+    this.TrayIcon.Text = "VRCX";
+    this.TrayIcon.Visible = true;
+    this.TrayIcon.MouseClick += new MouseEventHandler(this.TrayIcon_MouseClick);
+    this.AutoScaleDimensions = new SizeF(96f, 96f);
+    this.AutoScaleMode = AutoScaleMode.Dpi;
+    this.ClientSize = new Size(842, 561);
+    this.MinimumSize = new Size(320, 240 /*0xF0*/);
+    this.Name = nameof (MainForm);
+    this.StartPosition = FormStartPosition.CenterScreen;
+    this.Text = Program.Version;
+    this.FormClosing += new FormClosingEventHandler(this.MainForm_FormClosing);
+    this.FormClosed += new FormClosedEventHandler(this.MainForm_FormClosed);
+    this.Load += new EventHandler(this.MainForm_Load);
+    this.Move += new EventHandler(this.MainForm_Move);
+    this.Resize += new EventHandler(this.MainForm_Resize);
+    this.TrayMenu.ResumeLayout(false);
+    this.ResumeLayout(false);
+  }
+}
