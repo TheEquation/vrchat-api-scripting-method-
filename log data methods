@@ -1,8 +1,3 @@
-// Decompiled with JetBrains decompiler
-// Type: VRCX.LogWatcher
-// Assembly: VRCX, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null
-// MVID: F498D5C0-EE85-48AF-85F9-CFE34D3CF65C
-// Assembly location: C:\Program Files\VRCX\VRCX.dll
 
 using CefSharp;
 using NLog;
